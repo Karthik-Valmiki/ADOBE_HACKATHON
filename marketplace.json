@@ -1,0 +1,74 @@
+{
+  "name": "brand-ai-readiness-audit",
+  "version": "2.0.0",
+  "description": "Enterprise-grade AI discoverability and on-site engagement audit marketplace. Deterministic, evidence-backed, no model weights, no headless browser.",
+  "author": "Adobe Hackathon Team",
+  "license": "MIT",
+  "runtime_constraints": {
+    "max_audit_runtime_seconds": 300,
+    "http_client": "httpx_async",
+    "js_engine": "Node.js (jsdom virtual DOM)",
+    "pixel_geometry": "FORBIDDEN",
+    "headless_browser": "FORBIDDEN",
+    "model_weights": "FORBIDDEN",
+    "max_zip_size_mb": 50
+  },
+  "skills": [
+    {
+      "id": "audit-orchestrator",
+      "path": "skills/audit-orchestrator",
+      "entrypoint": true,
+      "version": "2.0.0",
+      "description": "Master entrypoint. Composes all specialist skills, enforces the cross-web corroboration contract, and emits the final audit report JSON."
+    },
+    {
+      "id": "crawl-access-audit",
+      "path": "skills/crawl-access-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "Crawl Access: robots.txt AI-agent disallow, multi-UA WAF detection, redirect hop counting, llms.txt discovery."
+    },
+    {
+      "id": "render-parity-audit",
+      "path": "skills/render-parity-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "Rendering Parity: CSR hydration gap (static vs JS-hydrated word count), visual data trap detection, semantic noise floor / DOM depth."
+    },
+    {
+      "id": "entity-structured-data-audit",
+      "path": "skills/entity-structured-data-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "JSON-LD entity anchor validation, sameAs disambiguation URI check, Schema.org completeness scoring."
+    },
+    {
+      "id": "corroboration-freshness-audit",
+      "path": "skills/corroboration-freshness-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "Cross-Web Corroboration: Wikidata entity corroboration, DuckDuckGo Lite temporal freshness delta. Emits the Cross-Web Output Contract consumed by engagement-audit."
+    },
+    {
+      "id": "engagement-audit",
+      "path": "skills/engagement-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "On-Site Engagement: Intent mismatch, hidden hash anchor trap, CTA above-hero boundary, full-screen overlay detection, web-to-AI price divergence, boilerplate noise ratio."
+    },
+    {
+      "id": "ai-content-signals-audit",
+      "path": "skills/ai-content-signals-audit",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "Content Signals: FAQ schema, breadcrumb schema, HowTo schema, Open Graph completeness, Twitter Card, canonical URL consistency, hreflang correctness, Sitemap freshness, Core Web Vitals proxies via resource hints."
+    },
+    {
+      "id": "report-serializer",
+      "path": "skills/report-serializer",
+      "entrypoint": false,
+      "version": "2.0.0",
+      "description": "Validates all findings against the output schema, deduplicates, sorts by severity, and serializes the final JSON + HTML dashboard report."
+    }
+  ]
+}
