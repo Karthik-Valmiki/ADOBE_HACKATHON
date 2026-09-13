@@ -24,19 +24,59 @@ from urllib.parse import urljoin, urlparse
 from .utils import BROWSER_UA, get_root_url, make_client, truncate_evidence
 
 
-async def run_ai_content_signals_audit(url: str, root_url: str) -> dict[str, Any]:
-    """Run all bonus content signal checks concurrently."""
+async def run_ai_content_signals_audit(
+    url: str,
+    root_url: str,
+    *,
+    prefetched_html: str = "",
+    prefetched_status: int = 0,
+    prefetched_robots_content: str = "",
+) -> dict[str, Any]:
+    """
+    Run all bonus content signal checks.
+
+    prefetched_html / prefetched_status / prefetched_robots_content: provided
+    by the orchestrator from single shared fetches.  If status > 0, no new
+    homepage network request is made.
+    """
     findings: list[dict] = []
 
-    # Fetch main page HTML
+    # ── Obtain page HTML ────────────────────────────────────────────────────────
     html = ""
-    try:
-        async with make_client(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
-            html = resp.text
-            final_url = str(resp.url)
-    except Exception as exc:
-        return {"findings": []}
+    fetch_status = 0
+    if prefetched_status > 0:
+        html = prefetched_html
+        fetch_status = prefetched_status
+    else:
+        try:
+            async with make_client(timeout=10.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
+                html = resp.text
+                fetch_status = resp.status_code
+        except Exception:
+            return {"findings": []}
+
+    # ── Status guard: skip signal checks on WAF/non-200 pages ──────────────
+    if fetch_status not in (0,) and not (200 <= fetch_status < 300):
+        return {
+            "findings": [{
+                "id": "F-SIGNAL-WAF-SKIP",
+                "title": f"Content signal checks skipped: HTTP {fetch_status} response",
+                "severity": "medium",
+                "type": "defect",
+                "evidence": (
+                    f"GET {url} returned HTTP {fetch_status}. "
+                    "Canonical, meta description, hreflang, and OG checks cannot be run on WAF challenge pages. "
+                    "Allowlist the audit IP to obtain accurate signal analysis."
+                ),
+                "suggested_action": {
+                    "summary": "Allowlist audit tool IP in WAF.",
+                    "priority": "medium", "effort": "medium",
+                    "implementation_hint": "See F-NET-WAF-BLOCK for instructions."
+                },
+                "check_ref": "CHECK-CANONICAL"
+            }]
+        }
 
     # Run checks concurrently where independent
     results = await asyncio.gather(
@@ -44,7 +84,7 @@ async def run_ai_content_signals_audit(url: str, root_url: str) -> dict[str, Any
         _check_meta_description(html),
         _check_robots_meta(html),
         _check_hreflang(html),
-        _check_sitemap(root_url),
+        _check_sitemap(root_url, prefetched_robots_content=prefetched_robots_content),
         return_exceptions=True,
     )
 
@@ -350,7 +390,7 @@ async def _check_hreflang(html: str) -> dict:
     return {"findings": findings}
 
 
-async def _check_sitemap(root_url: str) -> dict:
+async def _check_sitemap(root_url: str, *, prefetched_robots_content: str = "") -> dict:
     """F-SIGNAL-004: XML sitemap missing, unreachable, or stale."""
     findings: list[dict] = []
 
@@ -382,21 +422,31 @@ async def _check_sitemap(root_url: str) -> dict:
 
     if not sitemap_url:
         # Check robots.txt for Sitemap: directive
-        try:
-            async with make_client(timeout=5.0) as client:
-                robots_resp = await client.get(f"{root_url}/robots.txt")
-                if robots_resp.status_code == 200:
-                    sitemap_directive = re.search(
-                        r"^Sitemap:\s*(.+)$", robots_resp.text, re.MULTILINE | re.IGNORECASE
-                    )
-                    if sitemap_directive:
-                        sitemap_from_robots = sitemap_directive.group(1).strip()
+        # Use prefetched content if available, otherwise fetch
+        robots_text = prefetched_robots_content
+        if not robots_text:
+            try:
+                async with make_client(timeout=5.0) as client:
+                    robots_resp = await client.get(f"{root_url}/robots.txt")
+                    if robots_resp.status_code == 200:
+                        robots_text = robots_resp.text
+            except Exception:
+                robots_text = ""
+
+        if robots_text:
+            try:
+                sitemap_directive = re.search(
+                    r"^Sitemap:\s*(.+)$", robots_text, re.MULTILINE | re.IGNORECASE
+                )
+                if sitemap_directive:
+                    sitemap_from_robots = sitemap_directive.group(1).strip()
+                    async with make_client(timeout=5.0) as client:
                         resp2 = await client.get(sitemap_from_robots)
                         if resp2.status_code == 200:
                             sitemap_url = sitemap_from_robots
                             sitemap_content = resp2.text
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     if not sitemap_url:
         findings.append({

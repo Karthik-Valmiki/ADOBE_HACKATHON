@@ -53,6 +53,10 @@ def serialize_report(
         "medium": sum(1 for f in defects if f.get("severity") == "medium"),
         "low": sum(1 for f in defects if f.get("severity") == "low"),
         "proactive": len(proactive),
+        "by_category": {
+            "discoverability": sum(1 for f in unique_findings if not f.get("id", "").startswith("F-ENG") and not f.get("id", "").startswith("F-TIMEOUT")),
+            "engagement": sum(1 for f in unique_findings if f.get("id", "").startswith("F-ENG")),
+        }
     }
 
     report = {

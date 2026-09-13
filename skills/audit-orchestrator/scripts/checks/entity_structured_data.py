@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .utils import (
-    BROWSER_UA, find_json_ld_blocks, make_client, truncate_evidence,
+    BROWSER_UA, find_json_ld_blocks, is_waf_challenge_body, make_client, truncate_evidence,
 )
 
 # Authoritative disambiguation URIs for sameAs validation
@@ -53,36 +53,74 @@ BONUS_SCHEMA_TYPES = {
 }
 
 
-async def run_entity_structured_data_audit(url: str) -> dict[str, Any]:
+async def run_entity_structured_data_audit(
+    url: str,
+    *,
+    prefetched_html: str = "",
+    prefetched_status: int = 0,
+) -> dict[str, Any]:
     """
-    Fetch raw HTML, parse JSON-LD, validate entity anchor and Schema.org signals.
+    Fetch raw HTML (or use prefetched), parse JSON-LD, validate entity anchor and Schema.org signals.
     Returns: findings + brand_name (consumed by corroboration audit).
+
+    prefetched_html / prefetched_status: provided by orchestrator from the single
+    shared homepage fetch.  If status > 0, no new network request is made.
     """
     findings: list[dict] = []
     brand_name: str = ""
     wikidata_qid: str | None = None
 
-    # Fetch raw HTML (no JS hydration needed — JSON-LD is in static HTML)
-    try:
-        async with make_client(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
-            html = resp.text
-    except Exception as exc:
+    # ── Obtain page HTML ─────────────────────────────────────────────────────────
+    if prefetched_status > 0:
+        html = prefetched_html
+        status = prefetched_status
+    else:
+        # Fallback: fetch ourselves
+        try:
+            async with make_client(timeout=10.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
+                html = resp.text
+                status = resp.status_code
+        except Exception as exc:
+            return {
+                "findings": [{
+                    "id": "F-ENTITY-FETCH-ERR",
+                    "title": "Failed to fetch page for JSON-LD analysis",
+                    "severity": "medium",
+                    "type": "defect",
+                    "evidence": f"Fetch error: {type(exc).__name__}: {exc}",
+                    "suggested_action": {
+                        "summary": "Verify site is publicly accessible.",
+                        "priority": "medium", "effort": "low",
+                        "implementation_hint": "Check DNS and server availability."
+                    },
+                    "check_ref": "CHECK-1.8"
+                }],
+                "brand_name": "",
+            }
+
+    # ── Status guard: do not parse WAF/bot-challenge pages as real content ───
+    if status not in (200, 0) and status not in range(200, 300):
+        # Non-2xx: likely WAF block/challenge, return early with a specific finding
         return {
             "findings": [{
-                "id": "F-ENTITY-FETCH-ERR",
-                "title": "Failed to fetch page for JSON-LD analysis",
-                "severity": "medium",
+                "id": "F-ENTITY-WAF-BLOCK",
+                "title": f"JSON-LD audit skipped: homepage returned HTTP {status}",
+                "severity": "high",
                 "type": "defect",
-                "evidence": f"Fetch error: {type(exc).__name__}: {exc}",
+                "evidence": (
+                    f"GET {url} returned HTTP {status}. "
+                    "Page content is likely a WAF interstitial/challenge, not the real site. "
+                    "JSON-LD, Open Graph, and schema completeness cannot be assessed on challenge pages."
+                ),
                 "suggested_action": {
-                    "summary": "Verify site is publicly accessible.",
-                    "priority": "medium", "effort": "low",
-                    "implementation_hint": "Check DNS and server availability."
+                    "summary": "Ensure audit tool IP can access the site without WAF challenge pages.",
+                    "priority": "high", "effort": "medium",
+                    "implementation_hint": "Allowlist the audit IP in Cloudflare / WAF rules."
                 },
                 "check_ref": "CHECK-1.8"
             }],
-            "brand_name": "",
+            "brand_name": _extract_brand_name_fallback(html, url),
         }
 
     # Extract all JSON-LD blocks
@@ -108,15 +146,18 @@ async def run_entity_structured_data_audit(url: str) -> dict[str, Any]:
 
     # ── Check 1.8: Entity Identity Anchor ───────────────────────────────────
     if entity_block is None:
+        # Use fallback chain to extract brand_name even without JSON-LD Organization
+        brand_name = _extract_brand_name_fallback(html, url)
         findings.append({
             "id": "F-ENTITY-001",
             "title": "No JSON-LD Organization entity found",
             "severity": "high",
             "type": "defect",
             "evidence": (
-                f"Scanned {len(ld_blocks)} JSON-LD block(s) on page. "
+                f"HTTP {status}: Scanned {len(ld_blocks)} JSON-LD block(s) on page. "
                 f"Types found: {', '.join(all_types_found) if all_types_found else 'none'}. "
                 "No Organization, Corporation, LocalBusiness, or Brand @type present. "
+                f"Brand name inferred from fallback (og:site_name / title / domain): '{brand_name}'. "
                 "AI systems have no structured entity anchor — name disambiguation risk is high."
             ),
             "suggested_action": {
@@ -126,7 +167,7 @@ async def run_entity_structured_data_audit(url: str) -> dict[str, Any]:
                 ),
                 "priority": "high",
                 "effort": "low",
-                "implementation_hint": _org_schema_template("YourBrand", url),
+                "implementation_hint": _org_schema_template(brand_name or "YourBrand", url),
             },
             "check_ref": "CHECK-1.8"
         })
@@ -261,11 +302,16 @@ async def run_entity_structured_data_audit(url: str) -> dict[str, Any]:
     og_findings = _check_open_graph(html)
     findings.extend(og_findings)
 
+    # Ensure brand_name is populated even when entity is found but has no name
+    if not brand_name:
+        brand_name = _extract_brand_name_fallback(html, url)
+
     return {
         "findings": findings,
         "brand_name": brand_name,
         "wikidata_qid": wikidata_qid,
         "all_schema_types": all_types_found,
+        "homepage_status": status,
     }
 
 
@@ -322,6 +368,53 @@ def _check_open_graph(html: str) -> list[dict]:
         })
 
     return findings
+
+
+def _extract_brand_name_fallback(html: str, url: str) -> str:
+    """
+    Multi-source brand name fallback chain:
+      1. og:site_name meta tag
+      2. <title> tag (first word-group before separator chars: | - —)
+      3. domain hostname (e.g. 'dribbble' from 'dribbble.com')
+
+    Used when JSON-LD Organization.name is absent, so that corroboration
+    checks always have a non-empty string to search for.
+    """
+    # 1. og:site_name
+    og_site = re.search(
+        r'property=["\']og:site_name["\'][^>]+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE
+    ) or re.search(
+        r'content=["\']([^"\']+)["\'][^>]+property=["\']og:site_name["\']',
+        html, re.IGNORECASE
+    )
+    if og_site:
+        name = og_site.group(1).strip()
+        if name:
+            return name
+
+    # 2. <title> tag (content before first separator)
+    title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+    if title_match:
+        title_text = title_match.group(1).strip()
+        # Strip trailing separator and noise
+        name = re.split(r'[|\-—–·•]', title_text)[0].strip()
+        if name and len(name) <= 60:
+            return name
+
+    # 3. Domain hostname (strip www. and TLD)
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        host = re.sub(r'^www\.', '', host)
+        # Take the leftmost label (e.g. 'dribbble' from 'dribbble.com')
+        domain_name = host.split('.')[0]
+        if domain_name:
+            return domain_name.capitalize()
+    except Exception:
+        pass
+
+    return ""
 
 
 def _org_schema_template(name: str, url: str) -> str:

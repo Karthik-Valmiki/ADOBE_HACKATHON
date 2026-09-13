@@ -33,22 +33,35 @@ from .utils import (
 
 
 async def run_corroboration_freshness_audit(
-    url: str, root_url: str, brand_name: str
+    url: str, root_url: str, brand_name: str,
+    *,
+    prefetched_html: str = "",
+    prefetched_status: int = 0,
 ) -> dict[str, Any]:
     """
     Run Wikidata + DuckDuckGo Lite checks concurrently.
     Returns findings + cross_web_contract (corroboration output consumed by engagement audit).
+
+    prefetched_html / prefetched_status: provided by the orchestrator from its
+    single shared homepage fetch.  If status > 0, no new network request is made.
     """
     findings: list[dict] = []
 
-    # Fetch on-site content for freshness delta
+    # ── Obtain on-site HTML for year-extraction ─────────────────────────────
     site_html = ""
-    try:
-        async with make_client(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url)
-            site_html = resp.text
-    except Exception:
-        pass
+    if prefetched_status > 0:
+        # Use prefetched; only use content if it's a real 200 page
+        if 200 <= prefetched_status < 300:
+            site_html = prefetched_html
+    else:
+        try:
+            async with make_client(timeout=10.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+                if 200 <= resp.status_code < 300:
+                    site_html = resp.text
+        except Exception:
+            pass
+
 
     # Extract on-site year references
     all_text = re.sub(r"<[^>]+>", " ", site_html)
@@ -177,7 +190,7 @@ async def _check_wikidata(brand_name: str) -> dict:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(8.0, connect=5.0),
             follow_redirects=True,
-            headers={"User-Agent": "BrandAuditBot/2.0 (hackathon; read-only)"},
+            headers={"User-Agent": "BrandAIAuditBot/2.0 (https://github.com/adobe-hackathon; contact@example.com)"},
             verify=False,
         ) as client:
             resp = await client.get(search_url)

@@ -51,37 +51,75 @@ def _find_node() -> str | None:
 # Public entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_render_parity_audit(url: str) -> dict[str, Any]:
+async def run_render_parity_audit(
+    url: str,
+    *,
+    prefetched_html: str = "",
+    prefetched_status: int = 0,
+) -> dict[str, Any]:
     """
     Runs all client-side rendering parity checks.
     Returns findings + hydrated_dom_ast (raw hydrated HTML string).
+
+    prefetched_html / prefetched_status: provided by the orchestrator from its
+    single shared homepage fetch.  If status > 0, no new network request is made.
     """
     findings: list[dict] = []
 
-    # ── Fetch static HTML ────────────────────────────────────────────────────
+    # ── Obtain static HTML ───────────────────────────────────────────────────
     static_html = ""
-    try:
-        async with make_client(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
-            static_html = resp.text
-    except Exception as exc:
-        return {
-            "findings": [{
-                "id": "F-DOM-FETCH-ERR",
-                "title": "Failed to fetch page HTML",
-                "severity": "high",
-                "type": "defect",
-                "evidence": f"HTTP fetch error: {type(exc).__name__}: {exc}",
-                "suggested_action": {
-                    "summary": "Verify site is publicly accessible.",
-                    "priority": "high", "effort": "low",
-                    "implementation_hint": "Check DNS resolution and server availability."
-                },
-                "check_ref": "CHECK-1.5"
-            }],
-            "hydrated_dom_ast": None,
-            "js_engine_available": False,
-        }
+    if prefetched_status > 0:
+        static_html = prefetched_html
+        fetch_status = prefetched_status
+    else:
+        fetch_status = 0
+        try:
+            async with make_client(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
+                static_html = resp.text
+                fetch_status = resp.status_code
+        except Exception as exc:
+            return {
+                "findings": [{
+                    "id": "F-DOM-FETCH-ERR",
+                    "title": "Failed to fetch page HTML",
+                    "severity": "high",
+                    "type": "defect",
+                    "evidence": f"HTTP fetch error: {type(exc).__name__}: {exc}",
+                    "suggested_action": {
+                        "summary": "Verify site is publicly accessible.",
+                        "priority": "high", "effort": "low",
+                        "implementation_hint": "Check DNS resolution and server availability."
+                    },
+                    "check_ref": "CHECK-1.5"
+                }],
+                "hydrated_dom_ast": None,
+                "js_engine_available": False,
+            }
+
+    # ── Status guard: warn when response is not 200 ──────────────────────────
+    # We still run checks on the HTML (WAF bodies can expose their own signals)
+    # but we annotate findings so the report reader knows results may be skewed.
+    if fetch_status not in (0,) and not (200 <= fetch_status < 300):
+        findings.append({
+            "id": "F-DOM-WAF-DEGRADED",
+            "title": f"Render parity check degraded: HTTP {fetch_status} response",
+            "severity": "high",
+            "type": "defect",
+            "evidence": (
+                f"GET {url} returned HTTP {fetch_status}. "
+                "HTML content is likely a WAF interstitial rather than real page content. "
+                "CSR hydration gap (delta_H) is measured against challenge-page HTML, not the real page. "
+                "Results should be treated as unverified for this site."
+            ),
+            "suggested_action": {
+                "summary": "Allowlist audit tool IP in WAF to obtain accurate rendering analysis.",
+                "priority": "high", "effort": "medium",
+                "implementation_hint": "See F-NET-WAF-BLOCK finding for WAF allowlist instructions."
+            },
+            "check_ref": "CHECK-1.5"
+        })
+
 
     # Static word count (baseline)
     static_text = extract_semantic_text(static_html)
@@ -282,6 +320,10 @@ async def _run_jsdom_hydration(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # cwd MUST be the scripts/ directory so Node finds node_modules/jsdom
+        # relative to package.json.  Without this, Node searches from the
+        # process cwd (repo root) and raises 'Cannot find module jsdom'.
+        cwd=str(_SCRIPTS_DIR),
         # Ensure we don't inherit the parent's console environment issues
         env={**os.environ, "NODE_NO_WARNINGS": "1"},
     )

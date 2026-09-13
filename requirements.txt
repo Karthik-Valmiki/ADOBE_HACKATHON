@@ -3,4 +3,4 @@
 # JS hydration: Node.js + jsdom (external process, not a Python dep)
 
 httpx>=0.27.0
-# py-mini-racer removed — replaced by Node.js + jsdom (see jsdom_runner.js)
+# Node.js + jsdom (see jsdom_runner.js)

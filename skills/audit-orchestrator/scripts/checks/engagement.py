@@ -117,6 +117,27 @@ async def run_engagement_audit(
 
     html = hydrated_html
 
+    # --- WAF / Bot-Challenge Guard ---
+    # If the HTML is a Cloudflare/WAF interstitial, it is not a real page and 
+    # may contain obfuscated strings that break text parsers.
+    if html and ("challenge-platform" in html.lower() or "cf-browser-verification" in html.lower() or "just a moment..." in html.lower() or "cf-turnstile" in html.lower()):
+        return {
+            "findings": [{
+                "id": "F-ENG-WAF-DEGRADED",
+                "title": "On-site engagement checks skipped: HTTP 403 / WAF challenge page",
+                "severity": "medium",
+                "type": "defect",
+                "evidence": "A bot-challenge or WAF interstitial page was detected. Engagement checks (CTA, intent, noise ratio) cannot be evaluated accurately on challenge pages.",
+                "suggested_action": {
+                    "summary": "Allowlist audit tool IP in WAF to obtain accurate engagement analysis.",
+                    "priority": "medium",
+                    "effort": "medium",
+                    "implementation_hint": "See F-NET-WAF-BLOCK for WAF allowlist instructions."
+                },
+                "check_ref": "CHECK-2.0"
+            }]
+        }
+
     # Check 2.1: Intent Mismatch
     findings.extend(_check_intent_mismatch(url, html))
 
@@ -346,6 +367,8 @@ def _check_cta_above_hero(html: str) -> list[dict]:
     if h_match:
         hero_boundary_pos = h_match.start()
         h_tag = re.sub(r"<[^>]+>", "", h_match.group(0)[:50])
+        if not h_tag.isprintable() or "\ufffd" in h_tag:
+            h_tag = "[Obfuscated/Garbled Challenge String]"
         hero_boundary_desc = f"first H1/H2: '{h_tag}'"
 
     # Check for hero-class section (use original body, not de-navved)

@@ -32,13 +32,28 @@ AI_AGENT_NAMES = list(AI_USER_AGENTS.keys())
 AI_AGENT_STRINGS = list(AI_USER_AGENTS.values())
 
 
-async def run_crawl_access_audit(url: str, root_url: str) -> dict[str, Any]:
-    """Run all crawl access checks. Returns findings list + metadata."""
+async def run_crawl_access_audit(
+    url: str,
+    root_url: str,
+    *,
+    prefetched_robots_content: str = "",
+    prefetched_robots_status: int = 0,
+) -> dict[str, Any]:
+    """
+    Run all crawl access checks. Returns findings list + metadata.
+
+    prefetched_robots_content / prefetched_robots_status: If provided (from the
+    orchestrator's single pre-fetch), the robots.txt is NOT re-fetched here.
+    """
     findings: list[dict] = []
 
     # Run checks concurrently where independent
     results = await asyncio.gather(
-        _check_robots_txt(root_url),
+        _check_robots_txt(
+            root_url,
+            prefetched_content=prefetched_robots_content,
+            prefetched_status=prefetched_robots_status,
+        ),
         _check_multi_ua_waf(url),
         _check_redirect_hops(url),
         _check_llms_txt(root_url),
@@ -83,51 +98,68 @@ async def run_crawl_access_audit(url: str, root_url: str) -> dict[str, Any]:
 
 # ── Check 1.1 — robots.txt AI Agent Disallow ─────────────────────────────────
 
-async def _check_robots_txt(root_url: str) -> dict:
+async def _check_robots_txt(
+    root_url: str,
+    *,
+    prefetched_content: str = "",
+    prefetched_status: int = 0,
+) -> dict:
     """
     F-NET-001: Parse robots.txt for AI-agent Disallow rules.
-    Algorithm: fetch → line-by-line parse → per-agent block analysis.
+    Algorithm: fetch (or use prefetched) → line-by-line parse → per-agent block analysis.
+
+    If prefetched_content/prefetched_status are provided by the orchestrator,
+    the network fetch is skipped entirely to avoid duplicate requests.
     """
     findings: list[dict] = []
     robots_url = f"{root_url}/robots.txt"
 
-    try:
-        async with make_client(timeout=5.0, follow_redirects=True) as client:
-            resp = await client.get(robots_url, headers={"User-Agent": BROWSER_UA})
-    except httpx.ConnectError as ssl_exc:
-        if "SSL" in str(ssl_exc) or "certificate" in str(ssl_exc).lower():
-            return {
-                "findings": [{
-                    "id": "F-NET-TLS",
-                    "title": "TLS certificate error prevents AI crawler access",
-                    "severity": "high",
-                    "type": "defect",
-                    "evidence": (
-                        f"TLS handshake to {robots_url} failed: {ssl_exc}. "
-                        "AI crawlers with strict TLS enforcement (ClaudeBot, GPTBot) will refuse to connect."
-                    ),
-                    "suggested_action": {
-                        "summary": "Renew or replace the TLS certificate and verify the full chain is installed.",
-                        "priority": "high",
-                        "effort": "low",
-                        "implementation_hint": (
-                            "Check certificate status: echo | openssl s_client -connect your-site.com:443 -servername your-site.com 2>/dev/null | openssl x509 -noout -dates. "
-                            "Use Let's Encrypt (certbot) for free auto-renewing certificates."
-                        )
-                    },
-                    "check_ref": "CHECK-1.0-TLS"
-                }]
-            }
-        return {"findings": []}  # Other connection errors = no restriction determinable
-    except Exception:
-        return {"findings": []}  # 404 or other connection errors = no restriction determinable
+    if prefetched_status > 0:
+        # Use the content already fetched by the orchestrator
+        if prefetched_status == 404:
+            return {"findings": []}  # Absence = no restriction
+        if prefetched_status != 200:
+            return {"findings": []}
+        content = prefetched_content
+    else:
+        # Fallback: fetch ourselves (e.g. when called standalone)
+        try:
+            async with make_client(timeout=5.0, follow_redirects=True) as client:
+                resp = await client.get(robots_url, headers={"User-Agent": BROWSER_UA})
+        except httpx.ConnectError as ssl_exc:
+            if "SSL" in str(ssl_exc) or "certificate" in str(ssl_exc).lower():
+                return {
+                    "findings": [{
+                        "id": "F-NET-TLS",
+                        "title": "TLS certificate error prevents AI crawler access",
+                        "severity": "high",
+                        "type": "defect",
+                        "evidence": (
+                            f"TLS handshake to {robots_url} failed: {ssl_exc}. "
+                            "AI crawlers with strict TLS enforcement (ClaudeBot, GPTBot) will refuse to connect."
+                        ),
+                        "suggested_action": {
+                            "summary": "Renew or replace the TLS certificate and verify the full chain is installed.",
+                            "priority": "high",
+                            "effort": "low",
+                            "implementation_hint": (
+                                "Check certificate status: echo | openssl s_client -connect your-site.com:443 -servername your-site.com 2>/dev/null | openssl x509 -noout -dates. "
+                                "Use Let's Encrypt (certbot) for free auto-renewing certificates."
+                            )
+                        },
+                        "check_ref": "CHECK-1.0-TLS"
+                    }]
+                }
+            return {"findings": []}  # Other connection errors
+        except Exception:
+            return {"findings": []}
 
-    if resp.status_code == 404:
-        return {"findings": []}  # Absence of robots.txt = no restriction
-    if resp.status_code != 200:
-        return {"findings": []}
+        if resp.status_code == 404:
+            return {"findings": []}
+        if resp.status_code != 200:
+            return {"findings": []}
+        content = resp.text
 
-    content = resp.text
     blocked_agents = _parse_robots_txt(content, root_url)
 
     if blocked_agents:
@@ -213,8 +245,12 @@ async def _check_multi_ua_waf(url: str) -> dict:
     """
     findings: list[dict] = []
 
-    # Build all UA request tasks
-    async def fetch_with_ua(ua_name: str, ua_string: str) -> dict:
+    # Build all UA request tasks with stagger to avoid simultaneous burst
+    # that trips WAF bot-defence (Cloudflare, Akamai).
+    # Stagger: 0ms, 200ms, 400ms, 600ms, 800ms, 1000ms
+    async def fetch_with_ua(ua_name: str, ua_string: str, stagger_delay: float = 0.0) -> dict:
+        if stagger_delay > 0:
+            await asyncio.sleep(stagger_delay)
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(15.0, connect=5.0),
@@ -235,10 +271,10 @@ async def _check_multi_ua_waf(url: str) -> dict:
         except Exception as exc:
             return {"ua_name": ua_name, "status": 0, "ttfb_ms": 9999, "body_sample": "", "error": str(exc)}
 
-    # Build task list: browser baseline + all AI UAs
-    tasks = [fetch_with_ua("Browser", BROWSER_UA)]
-    for ua_name, ua_string in AI_USER_AGENTS.items():
-        tasks.append(fetch_with_ua(ua_name, ua_string))
+    # Browser baseline first (no stagger), then AI UAs with 200ms stagger each
+    tasks = [fetch_with_ua("Browser", BROWSER_UA, stagger_delay=0.0)]
+    for idx, (ua_name, ua_string) in enumerate(AI_USER_AGENTS.items()):
+        tasks.append(fetch_with_ua(ua_name, ua_string, stagger_delay=(idx + 1) * 0.2))
 
     results = await asyncio.gather(*tasks)
     browser_result = results[0]

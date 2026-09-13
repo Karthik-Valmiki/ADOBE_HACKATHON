@@ -10,6 +10,10 @@ Hard constraints enforced:
   - Zero pixel geometry
   - < 300s total runtime (asyncio.timeout)
   - findings[] NEVER empty
+
+Key design: homepage and robots.txt are fetched ONCE at orchestrator level and
+passed into every check that needs them.  This eliminates the 7+ redundant
+concurrent GETs that were triggering WAF bot-defence on protected domains.
 """
 
 from __future__ import annotations
@@ -42,15 +46,66 @@ from checks.corroboration_freshness import run_corroboration_freshness_audit
 from checks.engagement import run_engagement_audit
 from checks.ai_content_signals import run_ai_content_signals_audit
 from checks.report_serializer import serialize_report
-from checks.utils import normalize_url, validate_url
+from checks.utils import normalize_url, validate_url, make_client, BROWSER_UA, is_waf_challenge_body
 
 MAX_RUNTIME_SECONDS = 290  # Hard ceiling — spec mandates < 5 min
+
+
+async def _fetch_homepage(
+    url: str,
+) -> tuple[str, int, bool]:
+    """
+    Fetch the target homepage exactly once.
+    Returns (html, status_code, is_waf_challenge).
+    All callers share this result — no module re-fetches the URL.
+    """
+    try:
+        async with make_client(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
+            html = resp.text
+            status = resp.status_code
+            waf = is_waf_challenge_body(html) if status != 200 else False
+            _log.info(
+                "Homepage prefetch: %s → HTTP %d%s",
+                url, status,
+                " [WAF challenge body detected]" if waf else "",
+            )
+            return html, status, waf
+    except Exception as exc:
+        _log.warning("Homepage prefetch failed: %s", exc)
+        return "", 0, False
+
+
+async def _fetch_robots_txt(root_url: str) -> tuple[str, int]:
+    """
+    Fetch robots.txt for the root domain.
+    Returns (content, status_code). Called before page content checks as gate.
+    """
+    try:
+        async with make_client(timeout=6.0, follow_redirects=True) as client:
+            resp = await client.get(
+                f"{root_url}/robots.txt", headers={"User-Agent": BROWSER_UA}
+            )
+            _log.info("robots.txt prefetch: %s → HTTP %d", root_url, resp.status_code)
+            return resp.text, resp.status_code
+    except Exception as exc:
+        _log.warning("robots.txt prefetch failed: %s", exc)
+        return "", 0
 
 
 async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     """
     Main orchestration coroutine. Runs all check modules in dependency order.
     NEVER raises — all exceptions are caught and converted to structured findings.
+
+    Prefetch strategy
+    -----------------
+    The homepage HTML and robots.txt are fetched ONCE here at orchestrator level
+    before any parallel check is dispatched.  Each check module receives the
+    already-fetched content as an argument (homepage_html, homepage_status,
+    robots_txt_content) and MUST NOT re-fetch those same resources.
+    This reduces concurrent GETs from ~9 to ≤3 on protected domains and avoids
+    WAF challenge storms (HTTP 202/403 interstitials).
     """
     start_time = time.monotonic()
     all_findings: list[dict] = []
@@ -65,14 +120,83 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     except ValueError as exc:
         return _halt_report(url, str(exc), start_time)
 
+    # ── Step 0b: Prefetch robots.txt FIRST (crawler access gate) ────────────
+    # Per correct crawler protocol, robots.txt must be checked before any
+    # page content is fetched.  We do it synchronously here so the result
+    # can be passed into crawl_access without a duplicate network request.
+    _log.info("Prefetching robots.txt for %s", root_url)
+    robots_content, robots_status = await _fetch_robots_txt(root_url)
+
+    # ── Step 0c: Prefetch homepage HTML once ─────────────────────────────────
+    # ALL downstream checks receive this prefetched HTML; none re-fetches it.
+    _log.info("Prefetching homepage HTML for %s", normalised_url)
+    homepage_html, homepage_status, homepage_is_waf = await _fetch_homepage(normalised_url)
+
+    if homepage_status == 0:
+        # Hard network failure — emit finding but continue with empty html
+        all_findings.append({
+            "id": "F-NET-FETCH-ERR",
+            "title": "Homepage is unreachable — all content checks degraded",
+            "severity": "critical",
+            "type": "defect",
+            "evidence": (
+                f"Initial GET {normalised_url} raised a network exception (status 0). "
+                "DNS failure, TCP timeout, or TLS error. All HTML-based checks will "
+                "report no findings due to empty response body."
+            ),
+            "suggested_action": {
+                "summary": "Verify the site is publicly reachable from external IPs.",
+                "priority": "critical",
+                "effort": "low",
+                "implementation_hint": "Test: curl -I https://your-site.com"
+            },
+            "check_ref": "ORCHESTRATOR"
+        })
+    elif homepage_is_waf or homepage_status in (202, 403, 429, 503):
+        all_findings.append({
+            "id": "F-NET-WAF-BLOCK",
+            "title": f"Homepage returned HTTP {homepage_status} WAF/bot-challenge response",
+            "severity": "critical",
+            "type": "defect",
+            "evidence": (
+                f"Prefetch GET {normalised_url} returned HTTP {homepage_status}. "
+                f"{'WAF challenge body (Cloudflare/Akamai/Imperva pattern) detected. ' if homepage_is_waf else ''}"
+                "Content parsed by downstream checks may be interstitial HTML rather "
+                "than real page content — findings accuracy is degraded."
+            ),
+            "suggested_action": {
+                "summary": "Configure WAF to allow audit tool IP or reduce bot-challenge sensitivity.",
+                "priority": "critical",
+                "effort": "medium",
+                "implementation_hint": (
+                    "Cloudflare: Security > Bots > Bot Fight Mode — add audit IP to allowlist. "
+                    "Akamai: contact security team to allowlist the source IP."
+                )
+            },
+            "check_ref": "ORCHESTRATOR"
+        })
+
     # ── Step 1: Independent parallel checks (crawl, entity, signals) ────────
     _log.info("Running crawl access, entity, and content-signal checks on %s", root_url)
     try:
         async with asyncio.timeout(60):
             step1_results = await asyncio.gather(
-                run_crawl_access_audit(normalised_url, root_url),
-                run_entity_structured_data_audit(normalised_url),
-                run_ai_content_signals_audit(normalised_url, root_url),
+                run_crawl_access_audit(
+                    normalised_url, root_url,
+                    prefetched_robots_content=robots_content,
+                    prefetched_robots_status=robots_status,
+                ),
+                run_entity_structured_data_audit(
+                    normalised_url,
+                    prefetched_html=homepage_html,
+                    prefetched_status=homepage_status,
+                ),
+                run_ai_content_signals_audit(
+                    normalised_url, root_url,
+                    prefetched_html=homepage_html,
+                    prefetched_status=homepage_status,
+                    prefetched_robots_content=robots_content,
+                ),
                 return_exceptions=True,
             )
 
@@ -124,7 +248,11 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     hydrated_dom_ast = None
     try:
         async with asyncio.timeout(90):
-            render_result = await run_render_parity_audit(normalised_url)
+            render_result = await run_render_parity_audit(
+                normalised_url,
+                prefetched_html=homepage_html,
+                prefetched_status=homepage_status,
+            )
 
         if isinstance(render_result, Exception):
             checks_partial.append("render-parity-audit")
@@ -166,7 +294,9 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     try:
         async with asyncio.timeout(60):
             corroboration_result = await run_corroboration_freshness_audit(
-                normalised_url, root_url, brand_name
+                normalised_url, root_url, brand_name,
+                prefetched_html=homepage_html,
+                prefetched_status=homepage_status,
             )
 
         if isinstance(corroboration_result, Exception):
