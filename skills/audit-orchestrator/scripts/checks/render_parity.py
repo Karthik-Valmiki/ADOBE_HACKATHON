@@ -92,6 +92,10 @@ async def run_render_parity_audit(url: str) -> dict[str, Any]:
     js_engine_available = False
     w_hydrated = w_static
     jsdom_payload: dict = {}
+    # Tracks whether jsdom ran and returned a word count we can trust.
+    # When False, delta_H cannot be computed — skip F-DOM-001 to avoid
+    # emitting a false-positive "CSR gap" caused by a tooling failure.
+    jsdom_measurement_valid = False
 
     node_path = _find_node()
     if not node_path:
@@ -131,77 +135,101 @@ async def run_render_parity_audit(url: str) -> dict[str, Any]:
             hydrated_html, w_hydrated, js_engine_available, jsdom_payload = (
                 await _run_jsdom_hydration(url, static_html, node_path)
             )
+            jsdom_measurement_valid = True
         except Exception as exc:
-            # Non-fatal — fall back to static HTML, note in findings
+            # Non-fatal — fall back to static HTML.
+            # Emit a medium defect: we cannot measure the hydration gap, which is
+            # itself an auditable signal (the tool ran but jsdom failed to parse).
             findings.append({
                 "id": "F-DOM-JSDOM-ERR",
-                "title": "JS hydration failed — falling back to static HTML",
-                "severity": "low",
-                "type": "proactive",
-                "evidence": f"jsdom_runner error: {type(exc).__name__}: {exc}",
+                "title": "JS hydration engine error — CSR gap cannot be measured",
+                "severity": "medium",
+                "type": "defect",
+                "evidence": (
+                    f"jsdom_runner.js raised {type(exc).__name__}: {exc}. "
+                    "The CSR hydration gap (delta_H) cannot be computed for this run. "
+                    "All engagement checks that depend on the rendered DOM are operating "
+                    "on static HTML only — results may underreport content invisible to AI crawlers."
+                ),
                 "suggested_action": {
-                    "summary": "JS hydration encountered an error. Results may undercount CSR content.",
-                    "priority": "low", "effort": "low",
-                    "implementation_hint": "Check Node.js version (≥18) and run: npm install inside scripts/"
+                    "summary": "Resolve the jsdom runtime error so the hydration gap can be measured accurately.",
+                    "priority": "medium",
+                    "effort": "low",
+                    "implementation_hint": (
+                        "1. Verify Node.js ≥18 is on PATH: node --version. "
+                        "2. Install dependencies: cd skills/audit-orchestrator/scripts && npm install. "
+                        "3. Test the runner manually: echo '<html><body>test</body></html>' | "
+                        "node skills/audit-orchestrator/scripts/jsdom_runner.js https://example.com"
+                    )
                 },
                 "check_ref": "CHECK-1.5"
             })
 
     # ── Check 1.5: CSR Hydration Gap ────────────────────────────────────────
-    if w_hydrated > 0:
-        delta_h = w_static / w_hydrated
-    else:
-        delta_h = 0.0
+    # Only compute and emit the delta_H finding when jsdom ran successfully.
+    # If jsdom failed, both w_static and w_hydrated may be 0/equal through
+    # fallback assignment — that is a measurement gap, not a site defect.
+    if jsdom_measurement_valid:
+        if w_hydrated > 0:
+            delta_h = w_static / w_hydrated
+        else:
+            # jsdom ran and returned 0 words — almost certainly a pure CSR shell.
+            delta_h = 0.0
 
-    if delta_h < 0.15:
-        pct_invisible = (1 - delta_h) * 100
-        findings.append({
-            "id": "F-DOM-001",
-            "title": "Critical CSR hydration gap: most content invisible to basic AI crawlers",
-            "severity": "critical",
-            "type": "defect",
-            "evidence": (
-                f"Static HTML word count: {w_static}. "
-                f"Hydrated DOM word count (jsdom): {w_hydrated}. "
-                f"delta_H = {delta_h:.3f} ({delta_h*100:.1f}% — {pct_invisible:.1f}% content invisible to non-JS crawlers). "
-                "Indicates React/Vue/Angular CSR without SSR. "
-                "AI crawlers skipping JS execution see a near-empty page."
-            ),
-            "suggested_action": {
-                "summary": (
-                    "Implement Server-Side Rendering (SSR) or Static Site Generation (SSG). "
-                    "For React: use Next.js getServerSideProps/getStaticProps. "
-                    "For Vue: use Nuxt.js SSR mode. For Angular: use Angular Universal."
+        if delta_h < 0.15:
+            pct_invisible = (1 - delta_h) * 100
+            findings.append({
+                "id": "F-DOM-001",
+                "title": "Critical CSR hydration gap: most page content invisible to non-JS AI crawlers",
+                "severity": "critical",
+                "type": "defect",
+                "evidence": (
+                    f"Static HTML word count (semantic containers): {w_static}. "
+                    f"jsdom-hydrated DOM word count: {w_hydrated}. "
+                    f"delta_H = {delta_h:.3f} — {pct_invisible:.1f}% of content requires JavaScript to render. "
+                    "AI crawlers that skip JS execution (GPTBot, ClaudeBot) see a near-empty page. "
+                    "This is the single highest-impact discoverability defect for CSR-only sites."
                 ),
-                "priority": "critical",
-                "effort": "high",
-                "implementation_hint": (
-                    "Quick win: enable pre-rendering for key pages (home, pricing, about). "
-                    "Use Vercel/Netlify static export. "
-                    "Validate with: curl -A 'GPTBot/1.1' <url> | wc -w"
-                )
-            },
-            "check_ref": "CHECK-1.5"
-        })
-    elif delta_h >= 0.85:
-        findings.append({
-            "id": "F-DOM-SSR-OK",
-            "title": "Excellent SSR coverage: content fully visible to AI crawlers",
-            "severity": "low",
-            "type": "proactive",
-            "evidence": (
-                f"Static HTML word count: {w_static}. "
-                f"Hydrated DOM word count (jsdom): {w_hydrated}. "
-                f"delta_H = {delta_h:.3f} ({delta_h*100:.1f}% content in static HTML). "
-                "Content is fully accessible to non-JS AI crawlers."
-            ),
-            "suggested_action": {
-                "summary": "Excellent SSR coverage. Maintain server-side rendering on all key pages.",
-                "priority": "low", "effort": "low",
-                "implementation_hint": "Ensure new features / marketing pages also use SSR, not CSR-only."
-            },
-            "check_ref": "CHECK-1.5"
-        })
+                "suggested_action": {
+                    "summary": (
+                        "Implement Server-Side Rendering (SSR) or Static Site Generation (SSG). "
+                        "For React: use Next.js getServerSideProps/getStaticProps. "
+                        "For Vue: use Nuxt.js SSR mode. For Angular: use Angular Universal."
+                    ),
+                    "priority": "critical",
+                    "effort": "high",
+                    "implementation_hint": (
+                        "Quick win: enable pre-rendering for key pages (home, pricing, about). "
+                        "Use Vercel/Netlify static export. "
+                        "Validate after deploying with: curl -A 'GPTBot/1.1' <url> | wc -w "
+                        "(should return >200 words for content-heavy pages)."
+                    )
+                },
+                "check_ref": "CHECK-1.5"
+            })
+        elif delta_h >= 0.85:
+            findings.append({
+                "id": "F-DOM-SSR-OK",
+                "title": "Excellent SSR coverage: content fully visible to AI crawlers",
+                "severity": "low",
+                "type": "proactive",
+                "evidence": (
+                    f"Static HTML word count: {w_static}. "
+                    f"jsdom-hydrated DOM word count: {w_hydrated}. "
+                    f"delta_H = {delta_h:.3f} ({delta_h*100:.1f}% content present in static HTML). "
+                    "Content is fully accessible to non-JS AI crawlers without JavaScript execution."
+                ),
+                "suggested_action": {
+                    "summary": "Excellent SSR coverage. Maintain server-side rendering on all key pages.",
+                    "priority": "low", "effort": "low",
+                    "implementation_hint": "Ensure new features and marketing pages also use SSR, not CSR-only routes."
+                },
+                "check_ref": "CHECK-1.5"
+            })
+    else:
+        # jsdom did not run — delta_H is unmeasured.
+        # F-DOM-JSDOM-ERR or F-DOM-NODE-MISSING already emitted above.
+        delta_h = 0.0
 
     # ── Check 1.6: Visual Data Trap Detector ────────────────────────────────
     vdt_findings = _check_visual_data_trap(hydrated_html)

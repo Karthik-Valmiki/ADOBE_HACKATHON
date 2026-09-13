@@ -57,11 +57,18 @@ GET https://lite.duckduckgo.com/lite/?q="{brand_name}" "{key_product_term}"
 ```
 
 Parse year mentions (4-digit, 2010–2030) from snippet text.
-Compute `offsite_year_max` = maximum year found in snippets.
-Compute `temporal_delta` = current_year - offsite_year_max.
+Compute `offsite_year_max` = maximum year found across all DDG snippets.
+Extract `y_site` = maximum year mentioned anywhere in the site's own HTML.
+Compute `delta_freshness = y_site - offsite_year_max`.
 
-- If `temporal_delta >= 2`: emit `F-FRESH-001` (High) — AI knowledge about the brand is stale.
-- If DuckDuckGo is unavailable: emit `F-FRESH-UNVERIFIED` (Medium). **Never crash.**
+This measures whether the site's on-page claims are newer than what the external
+web corroborates — a divergence indicates AI knowledge about the brand may be stale.
+
+- If `delta_freshness >= 2`: emit `F-FRESH-001` (High) — on-site content is materially
+  ahead of what external sources confirm, meaning AI assistants will likely cite the
+  older external figures rather than the site's current claims.
+- If DuckDuckGo is unavailable or the brand name is unknown: emit `F-FRESH-UNVERIFIED`
+  (Medium). **Never crash.**
 
 ### Step 3 — Off-site Price Extraction
 

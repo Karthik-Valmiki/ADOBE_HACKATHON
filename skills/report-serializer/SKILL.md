@@ -47,6 +47,9 @@ one with higher severity (lower severity_order value).
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 ```
 
+Keep the first occurrence of each duplicate ID (order is deterministic because skills
+run in dependency order — the upstream skill that first emits a finding ID wins).
+
 ### Step 2 — Severity Sort
 
 Sort the deduplicated findings list:
@@ -90,20 +93,60 @@ crash; emit the best-effort report).
 
 ### Step 5 — Output Assembly
 
+The serializer emits the following top-level structure. **These field names are the
+authoritative contract** — every downstream consumer and the grading harness will
+reference them by these exact keys:
+
 ```json
 {
-  "schema_version": "2.0.0",
-  "audit_id": "<uuid4>",
-  "url": "<audited_url>",
-  "timestamp": "<ISO-8601>",
-  "duration_seconds": <float>,
-  "ai_readiness_score": <int 0-100>,
-  "score_band": "<Excellent|Good|Fair|Poor>",
-  "findings": [ ... ],
-  "layer3_summary": { ... },
-  "warnings": [ ... ]
+  "site": "<root URL of audited site>",
+  "audited_at": "<ISO-8601 UTC timestamp>",
+  "audit_version": "2.0.0",
+  "summary": {
+    "total_findings": "<int>",
+    "critical": "<int>",
+    "high": "<int>",
+    "medium": "<int>",
+    "low": "<int>",
+    "proactive": "<int>"
+  },
+  "findings": [
+    {
+      "id": "<string>",
+      "title": "<string>",
+      "severity": "critical | high | medium | low",
+      "type": "defect | proactive",
+      "evidence": "<string>",
+      "suggested_action": {
+        "summary": "<string>",
+        "priority": "critical | high | medium | low",
+        "effort": "low | medium | high",
+        "implementation_hint": "<string>"
+      },
+      "check_ref": "<string>"
+    }
+  ],
+  "cross_web_corroboration": {
+    "brand_name": "<string>",
+    "corroboration_status": "ok | rate_limited | blocked",
+    "wikidata_entity_found": "<bool>",
+    "wikidata_qid": "<string or null>",
+    "offsite_price_str": "<string>",
+    "offsite_price_num": "<float or null>",
+    "offsite_year_max": "<int or null>",
+    "offsite_snippets": ["<string>"]
+  },
+  "runtime_meta": {
+    "elapsed_seconds": "<float>",
+    "js_engine_available": "<bool>",
+    "checks_partial": ["<string>"]
+  }
 }
 ```
+
+> The `summary` block satisfies the Adobe minimum schema requirement for
+> `counts-by-severity`. The `site` and `audited_at` fields satisfy the
+> required `site` and `audited_at` top-level keys.
 
 ## Output
 

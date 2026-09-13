@@ -42,6 +42,11 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     # Import after path setup
     from audit_orchestrator import orchestrate  # type: ignore[import]
 
@@ -57,7 +62,7 @@ async def main() -> None:
     if args.format == "markdown":
         output_text = _render_markdown(report)
     else:
-        output_text = json.dumps(report, indent=2, ensure_ascii=False)
+        output_text = json.dumps(report, indent=2, ensure_ascii=True)
 
     if args.output:
         out_path = Path(args.output)

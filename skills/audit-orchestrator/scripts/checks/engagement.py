@@ -710,8 +710,49 @@ def _check_boilerplate_noise(html: str) -> list[dict]:
     n_boilerplate = len(re.findall(r"<[a-z][^/!>]*(?<!/)>", boilerplate_html, re.IGNORECASE))
     n_content = len(re.findall(r"<[a-z][^/!>]*(?<!/)>", content_html, re.IGNORECASE))
 
+    # Both counters zero: no HTML5 landmark elements exist in the static HTML.
+    # Emitting a '999x ratio' here would be factually wrong — there is no ratio
+    # to compute when both numerator and denominator are zero. This happens
+    # universally on CSR apps (React/Vue/Angular) where all markup is injected
+    # by JavaScript. Emit a targeted PARTIAL finding and return early.
+    if n_boilerplate == 0 and n_content == 0:
+        findings.append({
+            "id": "F-ENG-006-PARTIAL",
+            "title": "Boilerplate noise ratio unmeasurable: no HTML5 semantic landmark elements in static source",
+            "severity": "medium",
+            "type": "defect",
+            "evidence": (
+                "Element count in boilerplate regions (nav+header+footer+sidebar): 0. "
+                "Element count in content regions (main+article+.content): 0. "
+                "The page's static HTML contains no HTML5 semantic landmark elements. "
+                "AI content extractors rely on <main>, <article>, <nav> to separate "
+                "navigation chrome from substantive content. Without these landmarks "
+                "the entire DOM is treated as undifferentiated text, degrading extraction quality."
+            ),
+            "suggested_action": {
+                "summary": (
+                    "Wrap primary content in <main> or <article>, navigation in <nav>, "
+                    "and site-wide header/footer in <header>/<footer>."
+                ),
+                "priority": "medium",
+                "effort": "medium",
+                "implementation_hint": (
+                    "Minimum landmark structure: "
+                    "<header role='banner'>...</header> "
+                    "<nav role='navigation'>...</nav> "
+                    "<main role='main'><article>...</article></main> "
+                    "<footer role='contentinfo'>...</footer>. "
+                    "Validate at https://validator.w3.org/nu/ — look for 'no main landmark' warnings."
+                )
+            },
+            "check_ref": "CHECK-2.6"
+        })
+        return findings
+
+    # Content containers present — compute the actual ratio.
     if n_content == 0:
-        r_boilerplate = 999.0
+        # Boilerplate exists but no semantic content wrappers.
+        r_boilerplate = float(n_boilerplate)
     else:
         r_boilerplate = n_boilerplate / n_content
 
