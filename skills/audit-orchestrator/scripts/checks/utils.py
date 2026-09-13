@@ -33,7 +33,7 @@ BROWSER_UA = (
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
 }
 
@@ -60,6 +60,41 @@ def validate_url(url: str) -> str:
     if not parsed.netloc:
         raise ValueError(f"No hostname in URL: {url!r}")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+async def resolve_canonical_url(url: str) -> tuple[str, str]:
+    """
+    Follow HTTP redirects synchronously via a single HEAD request to discover
+    the canonical URL (e.g. http://adobe.com → https://www.adobe.com).
+
+    Returns (canonical_url, canonical_root) where:
+      - canonical_url  = fully resolved final URL (scheme + host + original path)
+      - canonical_root = scheme + resolved host only (no path)
+
+    Falls back to the normalised input URL if the HEAD request fails or times out.
+    This eliminates false-positive "unreachable" findings on bare domains that
+    redirect to www.* equivalents.
+    """
+    canonical_url = url
+    canonical_root = get_root_url(url)
+    try:
+        async with make_client(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.head(url, headers={"User-Agent": BROWSER_UA})
+            # After following redirects, the real URL is in resp.url
+            resolved = str(resp.url)
+            parsed = urlparse(resolved)
+            canonical_root = f"{parsed.scheme}://{parsed.netloc}"
+            # Re-attach original path/query if the input had one, otherwise use root
+            input_parsed = urlparse(url)
+            if input_parsed.path and input_parsed.path != "/":
+                # Keep original path (user may have specified a sub-page)
+                canonical_url = url
+            else:
+                canonical_url = canonical_root + "/"
+    except Exception:
+        # Non-fatal — fall back to normalised input
+        pass
+    return canonical_url, canonical_root
 
 
 def get_root_url(url: str) -> str:

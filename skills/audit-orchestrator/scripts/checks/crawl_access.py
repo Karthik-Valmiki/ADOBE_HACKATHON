@@ -472,14 +472,17 @@ async def _check_llms_txt(root_url: str) -> dict:
 
                 content_type = resp.headers.get("content-type", "").lower()
                 body = resp.text
+                # Normalise all line endings (CRLF, CR+CR+LF, bare CR) to LF
+                # before regex checks — some CDNs (e.g. Akamai) serve \r\r\n.
+                body_normalised = body.replace("\r\n", "\n").replace("\r", "\n")
                 body_bytes = len(resp.content)
 
                 # Validate: text/* or markdown, no HTML scaffold, no JS, ≥1 heading, >200 bytes
                 is_text = "text/" in content_type or "markdown" in content_type
-                has_no_html_scaffold = not re.search(r"<!DOCTYPE|<html|<head|<body", body, re.IGNORECASE)
-                has_no_js = "<script" not in body.lower()
-                has_heading = bool(re.search(r"^#{1,6}\s+\S", body, re.MULTILINE))
-                heading_count = len(re.findall(r"^#{1,6}\s+\S", body, re.MULTILINE))
+                has_no_html_scaffold = not re.search(r"<!DOCTYPE|<html|<head|<body", body_normalised, re.IGNORECASE)
+                has_no_js = "<script" not in body_normalised.lower()
+                has_heading = bool(re.search(r"^#{1,6}\s+\S", body_normalised, re.MULTILINE))
+                heading_count = len(re.findall(r"^#{1,6}\s+\S", body_normalised, re.MULTILINE))
                 is_large_enough = body_bytes > 200
 
                 if is_text and has_no_html_scaffold and has_no_js and has_heading and is_large_enough:

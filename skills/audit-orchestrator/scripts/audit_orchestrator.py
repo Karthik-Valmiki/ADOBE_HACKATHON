@@ -27,6 +27,8 @@ from datetime import timezone, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 # ── Logging: all progress to stderr so stdout carries only the final JSON ──────
 logging.basicConfig(
     stream=sys.stderr,
@@ -55,16 +57,23 @@ async def _fetch_homepage(
     url: str,
 ) -> tuple[str, int, bool]:
     """
-    Fetch the target homepage exactly once.
+    Fetch the target homepage exactly once against the canonical URL.
     Returns (html, status_code, is_waf_challenge).
-    All callers share this result — no module re-fetches the URL.
+    Uses a higher read timeout (25s) to handle large pages.
+    connect timeout is intentionally generous (10s) for slow DNS/TLS on redirect chains.
     """
     try:
-        async with make_client(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": BROWSER_UA})
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(25.0, connect=10.0),
+            follow_redirects=True,
+            headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                     "Accept-Language": "en-US,en;q=0.9",
+                     "User-Agent": BROWSER_UA},
+        ) as client:
+            resp = await client.get(url)
             html = resp.text
             status = resp.status_code
-            waf = is_waf_challenge_body(html) if status != 200 else False
+            waf = is_waf_challenge_body(html) if status == 200 else False
             _log.info(
                 "Homepage prefetch: %s → HTTP %d%s",
                 url, status,
@@ -76,21 +85,33 @@ async def _fetch_homepage(
         return "", 0, False
 
 
-async def _fetch_robots_txt(root_url: str) -> tuple[str, int]:
+async def _fetch_robots_txt(root_url: str) -> tuple[str, int, str]:
     """
     Fetch robots.txt for the root domain.
-    Returns (content, status_code). Called before page content checks as gate.
+    Returns (content, status_code, canonical_root).
+
+    canonical_root is extracted from resp.url after following redirects — this
+    gives us the real hostname (e.g. www.adobe.com) for free, without an
+    extra HEAD round-trip.  All downstream checks use this resolved root.
     """
     try:
-        async with make_client(timeout=6.0, follow_redirects=True) as client:
+        async with make_client(timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(
                 f"{root_url}/robots.txt", headers={"User-Agent": BROWSER_UA}
             )
-            _log.info("robots.txt prefetch: %s → HTTP %d", root_url, resp.status_code)
-            return resp.text, resp.status_code
+            # Extract canonical root from the resolved URL after redirect-following
+            from urllib.parse import urlparse
+            resolved = str(resp.url)
+            parsed = urlparse(resolved)
+            canonical_root = f"{parsed.scheme}://{parsed.netloc}"
+            _log.info(
+                "robots.txt prefetch: %s → HTTP %d (canonical root: %s)",
+                root_url, resp.status_code, canonical_root,
+            )
+            return resp.text, resp.status_code, canonical_root
     except Exception as exc:
         _log.warning("robots.txt prefetch failed: %s", exc)
-        return "", 0
+        return "", 0, root_url
 
 
 async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
@@ -113,7 +134,7 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     js_engine_available = False
     cross_web_corroboration: dict = {}
 
-    # ── Step 0: Validate + Normalise URL ────────────────────────────────────
+    # ── Step 0: Validate + Normalise URL ─────────────────────────────────────
     try:
         normalised_url = normalize_url(url)
         root_url = validate_url(normalised_url)
@@ -121,18 +142,33 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
         return _halt_report(url, str(exc), start_time)
 
     # ── Step 0b: Prefetch robots.txt FIRST (crawler access gate) ────────────
-    # Per correct crawler protocol, robots.txt must be checked before any
-    # page content is fetched.  We do it synchronously here so the result
-    # can be passed into crawl_access without a duplicate network request.
+    # robots.txt is fetched with follow_redirects=True, so resp.url reveals the
+    # real canonical hostname (e.g. https://www.adobe.com from https://adobe.com).
+    # We update root_url and normalised_url here at zero extra cost — no separate
+    # HEAD round-trip needed.  All downstream checks use the canonical root.
     _log.info("Prefetching robots.txt for %s", root_url)
-    robots_content, robots_status = await _fetch_robots_txt(root_url)
+    robots_content, robots_status, canonical_root = await _fetch_robots_txt(root_url)
+    if canonical_root != root_url:
+        _log.info("Canonical root resolved via robots.txt redirect: %s → %s", root_url, canonical_root)
+        root_url = canonical_root
+        # Re-derive normalised_url using canonical root (preserve any sub-path from input)
+        from urllib.parse import urlparse
+        _input_parsed = urlparse(normalised_url)
+        if _input_parsed.path and _input_parsed.path not in ("/", ""):
+            normalised_url = normalised_url  # keep sub-path as-is
+        else:
+            normalised_url = canonical_root + "/"
 
     # ── Step 0c: Prefetch homepage HTML once ─────────────────────────────────
-    # ALL downstream checks receive this prefetched HTML; none re-fetches it.
+    # Fetch against canonical URL. ALL downstream checks share this content.
     _log.info("Prefetching homepage HTML for %s", normalised_url)
     homepage_html, homepage_status, homepage_is_waf = await _fetch_homepage(normalised_url)
 
+    waf_blocked = False
+    is_hard_error = False
+
     if homepage_status == 0:
+        is_hard_error = True
         # Hard network failure — emit finding but continue with empty html
         all_findings.append({
             "id": "F-NET-FETCH-ERR",
@@ -153,6 +189,7 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
             "check_ref": "ORCHESTRATOR"
         })
     elif homepage_is_waf or homepage_status in (202, 403, 429, 503):
+        waf_blocked = True
         all_findings.append({
             "id": "F-NET-WAF-BLOCK",
             "title": f"Homepage returned HTTP {homepage_status} WAF/bot-challenge response",
@@ -215,7 +252,7 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
 
         # Extract brand_name from entity check; passed to corroboration step
         brand_name = ""
-        if not isinstance(entity_result, Exception):
+        if not isinstance(entity_result, Exception) and not waf_blocked:
             brand_name = entity_result.get("brand_name", "")
 
     except asyncio.TimeoutError:
@@ -246,64 +283,84 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
     # ── Step 2: DOM hydration via Node.js + jsdom ────────────────────────────
     _log.info("Running client-side rendering parity check (jsdom hydration)")
     hydrated_dom_ast = None
-    try:
-        async with asyncio.timeout(90):
-            render_result = await run_render_parity_audit(
-                normalised_url,
-                prefetched_html=homepage_html,
-                prefetched_status=homepage_status,
-            )
-
-        if isinstance(render_result, Exception):
-            checks_partial.append("render-parity-audit")
-            all_findings.append(_exception_finding("render-parity-audit", render_result))
-        else:
-            all_findings.extend(render_result.get("findings", []))
-            hydrated_dom_ast = render_result.get("hydrated_dom_ast")
-            js_engine_available = render_result.get("js_engine_available", False)
-            if not js_engine_available:
-                checks_partial.append("js-engine-unavailable")
-
-    except asyncio.TimeoutError:
-        checks_partial.append("render-parity-timeout")
-        all_findings.append({
-            "id": "F-TIMEOUT-002",
-            "title": "Client-side rendering check timed out",
-            "severity": "high",
-            "type": "defect",
-            "evidence": (
-                "jsdom hydration of the page exceeded 90 seconds. "
-                "Engagement checks that depend on the rendered DOM are running in static-HTML-only mode. "
-                "A slow-rendering page is itself an AI-discoverability risk: crawlers impose strict fetch budgets."
-            ),
-            "suggested_action": {
-                "summary": "Reduce Time-To-Interactive: eliminate render-blocking scripts, adopt server-side rendering.",
-                "priority": "high",
-                "effort": "high",
-                "implementation_hint": (
-                    "Audit inline script weight with Chrome DevTools > Coverage. "
-                    "Defer non-critical scripts with <script defer>. "
-                    "For React/Vue/Angular apps, enable SSR or static-site generation."
+    if not waf_blocked and not is_hard_error:
+        try:
+            async with asyncio.timeout(90):
+                render_result = await run_render_parity_audit(
+                    normalised_url,
+                    prefetched_html=homepage_html,
+                    prefetched_status=homepage_status,
                 )
-            },
-            "check_ref": "CHECK-1.5"
-        })
+
+            if isinstance(render_result, Exception):
+                checks_partial.append("render-parity-audit")
+                all_findings.append(_exception_finding("render-parity-audit", render_result))
+            else:
+                all_findings.extend(render_result.get("findings", []))
+                hydrated_dom_ast = render_result.get("hydrated_dom_ast")
+                js_engine_available = render_result.get("js_engine_available", False)
+                if not js_engine_available:
+                    checks_partial.append("js-engine-unavailable")
+
+        except asyncio.TimeoutError:
+            checks_partial.append("render-parity-timeout")
+            all_findings.append({
+                "id": "F-TIMEOUT-002",
+                "title": "Client-side rendering check timed out",
+                "severity": "high",
+                "type": "defect",
+                "evidence": (
+                    "jsdom hydration of the page exceeded 90 seconds. "
+                    "Engagement checks that depend on the rendered DOM are running in static-HTML-only mode. "
+                    "A slow-rendering page is itself an AI-discoverability risk: crawlers impose strict fetch budgets."
+                ),
+                "suggested_action": {
+                    "summary": "Reduce Time-To-Interactive: eliminate render-blocking scripts, adopt server-side rendering.",
+                    "priority": "high",
+                    "effort": "high",
+                    "implementation_hint": (
+                        "Audit inline script weight with Chrome DevTools > Coverage. "
+                        "Defer non-critical scripts with <script defer>. "
+                        "For React/Vue/Angular apps, enable SSR or static-site generation."
+                    )
+                },
+                "check_ref": "CHECK-1.5"
+            })
+    else:
+        checks_partial.append("render-parity-audit")
 
     # ── Step 3: Cross-web corroboration + temporal freshness ────────────────
     _log.info("Running cross-web corroboration and freshness audit (brand: %r)", brand_name)
-    try:
-        async with asyncio.timeout(60):
-            corroboration_result = await run_corroboration_freshness_audit(
-                normalised_url, root_url, brand_name,
-                prefetched_html=homepage_html,
-                prefetched_status=homepage_status,
-            )
+    if not waf_blocked and not is_hard_error and brand_name:
+        try:
+            async with asyncio.timeout(60):
+                corroboration_result = await run_corroboration_freshness_audit(
+                    normalised_url, root_url, brand_name,
+                    prefetched_html=homepage_html,
+                    prefetched_status=homepage_status,
+                )
 
-        if isinstance(corroboration_result, Exception):
-            checks_partial.append("corroboration-freshness-audit")
-            all_findings.append(_exception_finding("corroboration-freshness-audit", corroboration_result))
+            if isinstance(corroboration_result, Exception):
+                checks_partial.append("corroboration-freshness-audit")
+                all_findings.append(_exception_finding("corroboration-freshness-audit", corroboration_result))
+                cross_web_corroboration = {
+                    "corroboration_status": "blocked",
+                    "brand_name": brand_name,
+                    "offsite_price_str": "",
+                    "offsite_price_num": None,
+                    "offsite_year_max": None,
+                    "offsite_snippets": [],
+                    "wikidata_entity_found": False,
+                    "wikidata_qid": None,
+                }
+            else:
+                all_findings.extend(corroboration_result.get("findings", []))
+                cross_web_corroboration = corroboration_result.get("layer3_contract", {})
+
+        except asyncio.TimeoutError:
+            checks_partial.append("corroboration-freshness-timeout")
             cross_web_corroboration = {
-                "corroboration_status": "blocked",
+                "corroboration_status": "rate_limited",
                 "brand_name": brand_name,
                 "offsite_price_str": "",
                 "offsite_price_num": None,
@@ -312,14 +369,31 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
                 "wikidata_entity_found": False,
                 "wikidata_qid": None,
             }
-        else:
-            all_findings.extend(corroboration_result.get("findings", []))
-            cross_web_corroboration = corroboration_result.get("layer3_contract", {})
-
-    except asyncio.TimeoutError:
-        checks_partial.append("corroboration-freshness-timeout")
+            all_findings.append({
+                "id": "F-TIMEOUT-003",
+                "title": "Cross-web corroboration checks timed out",
+                "severity": "medium",
+                "type": "defect",
+                "evidence": (
+                    "Wikidata entity query and DuckDuckGo Lite freshness check exceeded the 60-second limit. "
+                    "Off-site corroboration status recorded as unverified. Re-run the audit to obtain full results."
+                ),
+                "suggested_action": {
+                    "summary": "Ensure outbound HTTPS access to wikidata.org and duckduckgo.com is available.",
+                    "priority": "low",
+                    "effort": "low",
+                    "implementation_hint": (
+                        "Test connectivity: curl -I https://www.wikidata.org/w/api.php "
+                        "and curl -I https://lite.duckduckgo.com/lite/. "
+                        "If behind a corporate proxy, configure HTTPS_PROXY environment variable."
+                    )
+                },
+                "check_ref": "CHECK-1.9-1.10"
+            })
+    else:
+        checks_partial.append("corroboration-freshness-audit")
         cross_web_corroboration = {
-            "corroboration_status": "rate_limited",
+            "corroboration_status": "blocked" if waf_blocked else "unknown",
             "brand_name": brand_name,
             "offsite_price_str": "",
             "offsite_price_num": None,
@@ -328,64 +402,46 @@ async def orchestrate(url: str, output_format: str = "json") -> dict[str, Any]:
             "wikidata_entity_found": False,
             "wikidata_qid": None,
         }
-        all_findings.append({
-            "id": "F-TIMEOUT-003",
-            "title": "Cross-web corroboration checks timed out",
-            "severity": "medium",
-            "type": "defect",
-            "evidence": (
-                "Wikidata entity query and DuckDuckGo Lite freshness check exceeded the 60-second limit. "
-                "Off-site corroboration status recorded as unverified. Re-run the audit to obtain full results."
-            ),
-            "suggested_action": {
-                "summary": "Ensure outbound HTTPS access to wikidata.org and duckduckgo.com is available.",
-                "priority": "low",
-                "effort": "low",
-                "implementation_hint": (
-                    "Test connectivity: curl -I https://www.wikidata.org/w/api.php "
-                    "and curl -I https://lite.duckduckgo.com/lite/. "
-                    "If behind a corporate proxy, configure HTTPS_PROXY environment variable."
-                )
-            },
-            "check_ref": "CHECK-1.9-1.10"
-        })
 
     # ── Step 4: On-site engagement checks ───────────────────────────────────
     _log.info("Running on-site engagement audit")
-    try:
-        async with asyncio.timeout(60):
-            engagement_result = await run_engagement_audit(
-                normalised_url, hydrated_dom_ast, cross_web_corroboration
-            )
-
-        if isinstance(engagement_result, Exception):
-            checks_partial.append("engagement-audit")
-            all_findings.append(_exception_finding("engagement-audit", engagement_result))
-        else:
-            all_findings.extend(engagement_result.get("findings", []))
-
-    except asyncio.TimeoutError:
-        checks_partial.append("engagement-audit-timeout")
-        all_findings.append({
-            "id": "F-TIMEOUT-004",
-            "title": "On-site engagement checks timed out",
-            "severity": "medium",
-            "type": "defect",
-            "evidence": "Engagement analysis exceeded 60 seconds. Intent mismatch, overlay, and price divergence checks are incomplete.",
-            "suggested_action": {
-                "summary": "Re-run the audit. If the site consistently times out, investigate server response latency.",
-                "priority": "medium",
-                "effort": "low",
-                "implementation_hint": (
-                    "Measure page load time: curl -o /dev/null -w '%{time_total}' https://your-site.com. "
-                    "Values above 5 seconds will cause this timeout consistently."
+    if not waf_blocked and not is_hard_error:
+        try:
+            async with asyncio.timeout(60):
+                engagement_result = await run_engagement_audit(
+                    normalised_url, hydrated_dom_ast, cross_web_corroboration
                 )
-            },
-            "check_ref": "CHECK-2.1-2.6"
-        })
+
+            if isinstance(engagement_result, Exception):
+                checks_partial.append("engagement-audit")
+                all_findings.append(_exception_finding("engagement-audit", engagement_result))
+            else:
+                all_findings.extend(engagement_result.get("findings", []))
+
+        except asyncio.TimeoutError:
+            checks_partial.append("engagement-audit-timeout")
+            all_findings.append({
+                "id": "F-TIMEOUT-004",
+                "title": "On-site engagement checks timed out",
+                "severity": "medium",
+                "type": "defect",
+                "evidence": "Engagement analysis exceeded 60 seconds. Intent mismatch, overlay, and price divergence checks are incomplete.",
+                "suggested_action": {
+                    "summary": "Re-run the audit. If the site consistently times out, investigate server response latency.",
+                    "priority": "medium",
+                    "effort": "low",
+                    "implementation_hint": (
+                        "Measure page load time: curl -o /dev/null -w '%{time_total}' https://your-site.com. "
+                        "Values above 5 seconds will cause this timeout consistently."
+                    )
+                },
+                "check_ref": "CHECK-2.1-2.6"
+            })
+    else:
+        checks_partial.append("engagement-audit")
 
     # ── Step 5: Proactive findings (required when no defects) ───────────────
-    proactive = _compute_proactive_findings(all_findings, cross_web_corroboration)
+    proactive = _compute_proactive_findings(all_findings, cross_web_corroboration, waf_blocked, is_hard_error)
     all_findings.extend(proactive)
 
     # MANDATORY: findings[] must NEVER be empty (spec constraint)
@@ -482,9 +538,13 @@ def _exception_finding(skill: str, exc: Exception) -> dict:
 
 
 def _compute_proactive_findings(
-    findings: list[dict], corroboration: dict
+    findings: list[dict], corroboration: dict, waf_blocked: bool, is_hard_error: bool
 ) -> list[dict]:
     """Emit proactive confirmation findings for check groups that returned zero defects."""
+    if waf_blocked or is_hard_error:
+        # Never emit "all checks passed" when we didn't run the checks
+        return []
+
     proactive = []
     defect_ids = {f["id"] for f in findings if f.get("type") != "proactive"}
 
